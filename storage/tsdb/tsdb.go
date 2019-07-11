@@ -26,6 +26,7 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
 )
 
 // ErrNotReady is returned if the underlying storage is not ready yet.
@@ -239,37 +240,35 @@ func (a adapter) Close() error {
 }
 
 type querier struct {
-	q tsdb.Querier
+	q storage.Querier
 }
 
-func (q querier) Select(_ *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
-	set, err := q.q.Select(ms...)
+func (q querier) Select(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+	set, ws, err := q.q.Select(p, ms...)
 	if err != nil {
-		return nil, nil, err
+		return nil, ws, err
 	}
-	return seriesSet{set: set}, nil, nil
+	return seriesSet{set: set}, ws, nil
 }
 
-func (q querier) SelectSorted(_ *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
-	set, err := q.q.SelectSorted(ms...)
+func (q querier) SelectSorted(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+	set, ws, err := q.q.SelectSorted(p, ms...)
 	if err != nil {
-		return nil, nil, err
+		return nil, ws, err
 	}
-	return seriesSet{set: set}, nil, nil
+	return seriesSet{set: set}, ws, nil
 }
 
 func (q querier) LabelValues(name string) ([]string, storage.Warnings, error) {
-	v, err := q.q.LabelValues(name)
-	return v, nil, err
+	return q.LabelValues(name)
 }
 func (q querier) LabelNames() ([]string, storage.Warnings, error) {
-	v, err := q.q.LabelNames()
-	return v, nil, err
+	return q.q.LabelNames()
 }
 func (q querier) Close() error { return q.q.Close() }
 
 type seriesSet struct {
-	set tsdb.SeriesSet
+	set storage.SeriesSet
 }
 
 func (s seriesSet) Next() bool         { return s.set.Next() }
@@ -277,11 +276,11 @@ func (s seriesSet) Err() error         { return s.set.Err() }
 func (s seriesSet) At() storage.Series { return series{s: s.set.At()} }
 
 type series struct {
-	s tsdb.Series
+	s storage.Series
 }
 
-func (s series) Labels() labels.Labels            { return s.s.Labels() }
-func (s series) Iterator() storage.SeriesIterator { return s.s.Iterator() }
+func (s series) Labels() labels.Labels       { return s.s.Labels() }
+func (s series) Iterator() chunkenc.Iterator { return s.s.Iterator() }
 
 type appender struct {
 	a tsdb.Appender

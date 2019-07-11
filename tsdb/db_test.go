@@ -29,6 +29,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
 
 	"github.com/go-kit/kit/log"
@@ -60,7 +61,7 @@ func openTestDB(t testing.TB, opts *Options) (db *DB, close func()) {
 }
 
 // query runs a matcher query against the querier and fully expands its data.
-func query(t testing.TB, q Querier, matchers ...*labels.Matcher) map[string][]tsdbutil.Sample {
+func query(t testing.TB, q storage.Querier, matchers ...*labels.Matcher) map[string][]tsdbutil.Sample {
 	ss, err := q.Select(matchers...)
 	defer func() {
 		testutil.Ok(t, q.Close())
@@ -304,7 +305,7 @@ Outer:
 		q, err := db.Querier(0, numSamples)
 		testutil.Ok(t, err)
 
-		res, err := q.Select(labels.MustNewMatcher(labels.MatchEqual, "a", "b"))
+		res, _, err := q.Select(nil, labels.MustNewMatcher(labels.MatchEqual, "a", "b"))
 		testutil.Ok(t, err)
 
 		expSamples := make([]tsdbutil.Sample, 0, len(c.remaint))
@@ -312,7 +313,7 @@ Outer:
 			expSamples = append(expSamples, sample{ts, smpls[ts]})
 		}
 
-		expss := newMockSeriesSet([]Series{
+		expss := newMockSeriesSet([]storage.Series{
 			newSeries(map[string]string{"a": "b"}, expSamples),
 		})
 
@@ -598,7 +599,7 @@ Outer:
 			expSamples = append(expSamples, sample{ts, smpls[ts]})
 		}
 
-		expss := newMockSeriesSet([]Series{
+		expss := newMockSeriesSet([]storage.Series{
 			newSeries(map[string]string{"a": "b"}, expSamples),
 		})
 
@@ -927,7 +928,7 @@ func TestTombstoneClean(t *testing.T) {
 			expSamples = append(expSamples, sample{ts, smpls[ts]})
 		}
 
-		expss := newMockSeriesSet([]Series{
+		expss := newMockSeriesSet([]storage.Series{
 			newSeries(map[string]string{"a": "b"}, expSamples),
 		})
 
@@ -1827,7 +1828,7 @@ func TestCorrectNumTombstones(t *testing.T) {
 
 func TestVerticalCompaction(t *testing.T) {
 	cases := []struct {
-		blockSeries          [][]Series
+		blockSeries          [][]storage.Series
 		expSeries            map[string][]tsdbutil.Sample
 		expBlockNum          int
 		expOverlappingBlocks int
@@ -1836,7 +1837,7 @@ func TestVerticalCompaction(t *testing.T) {
 		// |--------------|
 		//        |----------------|
 		{
-			blockSeries: [][]Series{
+			blockSeries: [][]storage.Series{
 				{
 					newSeries(map[string]string{"a": "b"}, []tsdbutil.Sample{
 						sample{0, 0}, sample{1, 0}, sample{2, 0}, sample{4, 0},
@@ -1864,7 +1865,7 @@ func TestVerticalCompaction(t *testing.T) {
 		// |-------------------------------|
 		//        |----------------|
 		{
-			blockSeries: [][]Series{
+			blockSeries: [][]storage.Series{
 				{
 					newSeries(map[string]string{"a": "b"}, []tsdbutil.Sample{
 						sample{0, 0}, sample{1, 0}, sample{2, 0}, sample{4, 0},
@@ -1893,7 +1894,7 @@ func TestVerticalCompaction(t *testing.T) {
 		//        |------------|
 		//                           |--------------------|
 		{
-			blockSeries: [][]Series{
+			blockSeries: [][]storage.Series{
 				{
 					newSeries(map[string]string{"a": "b"}, []tsdbutil.Sample{
 						sample{0, 0}, sample{1, 0}, sample{2, 0}, sample{4, 0},
@@ -1929,7 +1930,7 @@ func TestVerticalCompaction(t *testing.T) {
 		//                           |--------------------|
 		//               |----------------|
 		{
-			blockSeries: [][]Series{
+			blockSeries: [][]storage.Series{
 				{
 					newSeries(map[string]string{"a": "b"}, []tsdbutil.Sample{
 						sample{0, 0}, sample{1, 0}, sample{2, 0}, sample{4, 0},

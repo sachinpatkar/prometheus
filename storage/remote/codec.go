@@ -185,8 +185,77 @@ func NegotiateResponseType(accepted []prompb.ReadRequest_ResponseType) (prompb.R
 }
 
 // StreamChunkedReadResponses iterates over series, builds chunks and streams those to the caller.
-// TODO(bwplotka): Encode only what's needed. Fetch the encoded series from blocks instead of re-encoding everything.
 func StreamChunkedReadResponses(
+	stream io.Writer,
+	queryIndex int64,
+	ss storage.ChunkSeriesSet,
+	sortedExternalLabels []prompb.Label,
+	maxBytesInFrame int,
+) error {
+	var (
+		chks           []prompb.Chunk
+		lbls           []prompb.Label
+		lblsSize       int
+		frameBytesLeft int
+	)
+
+	for ss.Next() {
+		series := ss.At()
+		chIter := series.Iterator()
+		lbls = MergeLabels(labelsToLabelsProto(series.Labels(), lbls), sortedExternalLabels)
+
+		lblsSize = 0
+		for _, lbl := range lbls {
+			lblsSize += lbl.Size()
+		}
+
+		frameBytesLeft = maxBytesInFrame - lblsSize
+		chks = chks[:0]
+
+		// Send at most one series per frame; series may be split over multiple frames according to maxBytesInFrame.
+		for chIter.Next() {
+			chk := chIter.At()
+
+			chks = append(chks, prompb.Chunk{
+				MinTimeMs: chk.MinTime,
+				MaxTimeMs: chk.MaxTime,
+				Type:      prompb.Chunk_Encoding(chk.Chunk.Encoding()),
+				Data:      chk.Chunk.Bytes(),
+			})
+
+			// We are fine with minor inaccuracy of max bytes per frame.
+			// The inaccuracy will be max of full chunk size.
+			frameBytesLeft -= chks[len(chks)-1].Size()
+			if frameBytesLeft > 0 {
+				continue
+			}
+
+			b, err := proto.Marshal(&prompb.ChunkedReadResponse{
+				ChunkedSeries: []*prompb.ChunkedSeries{{Labels: lbls, Chunks: chks}},
+				QueryIndex:    queryIndex,
+			})
+			if err != nil {
+				return errors.Wrap(err, "marshal ChunkedReadResponse")
+			}
+
+			if _, err := stream.Write(b); err != nil {
+				return errors.Wrap(err, "write to stream")
+			}
+
+			chks = chks[:0]
+		}
+
+		if err := chIter.Err(); err != nil {
+			return err
+		}
+	}
+
+	return ss.Err()
+}
+
+// StreamChunkedReadResponsesOLD iterates over series, builds chunks and streams those to the caller.
+// TODO(bwplotka): Encode only what's needed. Fetch the encoded series from blocks instead of re-encoding everything.
+func StreamChunkedReadResponsesOLD(
 	stream io.Writer,
 	queryIndex int64,
 	ss storage.SeriesSet,
@@ -254,7 +323,7 @@ func StreamChunkedReadResponses(
 }
 
 // encodeChunks expects iterator to be ready to use (aka iter.Next() called before invoking).
-func encodeChunks(iter storage.SeriesIterator, chks []prompb.Chunk, frameBytesLeft int) ([]prompb.Chunk, error) {
+func encodeChunks(iter chunkenc.Iterator, chks []prompb.Chunk, frameBytesLeft int) ([]prompb.Chunk, error) {
 	const maxSamplesInChunk = 120
 
 	var (
@@ -392,24 +461,24 @@ func (c *concreteSeries) Labels() labels.Labels {
 	return labels.New(c.labels...)
 }
 
-func (c *concreteSeries) Iterator() storage.SeriesIterator {
+func (c *concreteSeries) Iterator() chunkenc.Iterator {
 	return newConcreteSeriersIterator(c)
 }
 
-// concreteSeriesIterator implements storage.SeriesIterator.
+// concreteSeriesIterator implements chunkenc.Iterator.
 type concreteSeriesIterator struct {
 	cur    int
 	series *concreteSeries
 }
 
-func newConcreteSeriersIterator(series *concreteSeries) storage.SeriesIterator {
+func newConcreteSeriersIterator(series *concreteSeries) chunkenc.Iterator {
 	return &concreteSeriesIterator{
 		cur:    -1,
 		series: series,
 	}
 }
 
-// Seek implements storage.SeriesIterator.
+// Seek implements chunkenc.Iterator.
 func (c *concreteSeriesIterator) Seek(t int64) bool {
 	c.cur = sort.Search(len(c.series.samples), func(n int) bool {
 		return c.series.samples[n].Timestamp >= t
@@ -417,19 +486,19 @@ func (c *concreteSeriesIterator) Seek(t int64) bool {
 	return c.cur < len(c.series.samples)
 }
 
-// At implements storage.SeriesIterator.
+// At implements chunkenc.Iterator.
 func (c *concreteSeriesIterator) At() (t int64, v float64) {
 	s := c.series.samples[c.cur]
 	return s.Timestamp, s.Value
 }
 
-// Next implements storage.SeriesIterator.
+// Next implements chunkenc.Iterator.
 func (c *concreteSeriesIterator) Next() bool {
 	c.cur++
 	return c.cur < len(c.series.samples)
 }
 
-// Err implements storage.SeriesIterator.
+// Err implements chunkenc.Iterator.
 func (c *concreteSeriesIterator) Err() error {
 	return nil
 }

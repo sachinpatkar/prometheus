@@ -16,6 +16,7 @@ package storage
 import (
 	"container/heap"
 	"context"
+	"math"
 	"sort"
 	"strings"
 
@@ -24,6 +25,8 @@ import (
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/tsdb/chunks"
 )
 
 type fanout struct {
@@ -258,7 +261,7 @@ func (q *mergeQuerier) SelectSorted(params *SelectParams, matchers ...*labels.Ma
 		}
 		seriesSets = append(seriesSets, set)
 	}
-	return NewMergeSeriesSet(seriesSets, q), warnings, nil
+	return newMergeSeriesSet(seriesSets, q.IsFailedSet), warnings, nil
 }
 
 // LabelValues returns all potential values for a label name.
@@ -383,14 +386,36 @@ type mergeSeriesSet struct {
 	heap          seriesSetHeap
 	sets          []SeriesSet
 
-	querier *mergeQuerier
+	isFailedSetFn func(set SeriesSet) bool
 }
 
 // NewMergeSeriesSet returns a new series set that merges (deduplicates)
 // series returned by the input series sets when iterating.
 // Each input series set must return its series in labels order, otherwise
 // merged series set will be incorrect.
-func NewMergeSeriesSet(sets []SeriesSet, querier *mergeQuerier) SeriesSet {
+func NewMergeSeriesSet(sets ...SeriesSet) SeriesSet {
+	return newMergeSeriesSet(sets, nil)
+}
+
+var emptySeriesSet = errSeriesSet{}
+
+type errSeriesSet struct {
+	err error
+}
+
+func (s errSeriesSet) Next() bool { return false }
+func (s errSeriesSet) At() Series { return nil }
+func (s errSeriesSet) Err() error { return s.err }
+
+// EmptySeriesSet returns a series set that's always empty.
+func EmptySeriesSet() SeriesSet {
+	return emptySeriesSet
+}
+
+func newMergeSeriesSet(sets []SeriesSet, isFailedSetFn func(set SeriesSet) bool) SeriesSet {
+	if len(sets) == 0 {
+		return EmptySeriesSet()
+	}
 	if len(sets) == 1 {
 		return sets[0]
 	}
@@ -407,9 +432,9 @@ func NewMergeSeriesSet(sets []SeriesSet, querier *mergeQuerier) SeriesSet {
 		}
 	}
 	return &mergeSeriesSet{
-		heap:    h,
-		sets:    sets,
-		querier: querier,
+		heap:          h,
+		sets:          sets,
+		isFailedSetFn: isFailedSetFn,
 	}
 }
 
@@ -435,7 +460,7 @@ func (c *mergeSeriesSet) Next() bool {
 		c.currentLabels = c.heap[0].At().Labels()
 		for len(c.heap) > 0 && labels.Equal(c.currentLabels, c.heap[0].At().Labels()) {
 			set := heap.Pop(&c.heap).(SeriesSet)
-			if c.querier != nil && c.querier.IsFailedSet(set) {
+			if c.isFailedSetFn != nil && c.isFailedSetFn(set) {
 				continue
 			}
 			c.currentSets = append(c.currentSets, set)
@@ -504,27 +529,30 @@ func (m *mergeSeries) Labels() labels.Labels {
 	return m.labels
 }
 
-func (m *mergeSeries) Iterator() SeriesIterator {
-	iterators := make([]SeriesIterator, 0, len(m.series))
-	for _, s := range m.series {
-		iterators = append(iterators, s.Iterator())
-	}
-	return newMergeIterator(iterators)
+func (m *mergeSeries) Iterator() chunkenc.Iterator {
+	return newChainedSeriesIterator(m.series...)
 }
 
-type mergeIterator struct {
-	iterators []SeriesIterator
+func (m *mergeSeries) ChunkIterator() ChunkIterator {
+	return newChainedSeriesChunkIterator(m.series...)
+}
+
+type chainedSeriesIterator struct {
+	iterators []chunkenc.Iterator
 	h         seriesIteratorHeap
 }
 
-func newMergeIterator(iterators []SeriesIterator) SeriesIterator {
-	return &mergeIterator{
+func newChainedSeriesIterator(series ...Series) chunkenc.Iterator {
+	iterators := make([]chunkenc.Iterator, 0, len(series))
+	for _, s := range series {
+		iterators = append(iterators, s.Iterator())
+	}
+	return &chainedSeriesIterator{
 		iterators: iterators,
-		h:         nil,
 	}
 }
 
-func (c *mergeIterator) Seek(t int64) bool {
+func (c *chainedSeriesIterator) Seek(t int64) bool {
 	c.h = seriesIteratorHeap{}
 	for _, iter := range c.iterators {
 		if iter.Seek(t) {
@@ -534,15 +562,15 @@ func (c *mergeIterator) Seek(t int64) bool {
 	return len(c.h) > 0
 }
 
-func (c *mergeIterator) At() (t int64, v float64) {
+func (c *chainedSeriesIterator) At() (t int64, v float64) {
 	if len(c.h) == 0 {
-		panic("mergeIterator.At() called after .Next() returned false.")
+		return math.MinInt64, 0
 	}
 
 	return c.h[0].At()
 }
 
-func (c *mergeIterator) Next() bool {
+func (c *chainedSeriesIterator) Next() bool {
 	if c.h == nil {
 		for _, iter := range c.iterators {
 			if iter.Next() {
@@ -564,7 +592,7 @@ func (c *mergeIterator) Next() bool {
 			break
 		}
 
-		iter := heap.Pop(&c.h).(SeriesIterator)
+		iter := heap.Pop(&c.h).(chunkenc.Iterator)
 		if iter.Next() {
 			heap.Push(&c.h, iter)
 		}
@@ -573,7 +601,7 @@ func (c *mergeIterator) Next() bool {
 	return len(c.h) > 0
 }
 
-func (c *mergeIterator) Err() error {
+func (c *chainedSeriesIterator) Err() error {
 	for _, iter := range c.iterators {
 		if err := iter.Err(); err != nil {
 			return err
@@ -582,7 +610,7 @@ func (c *mergeIterator) Err() error {
 	return nil
 }
 
-type seriesIteratorHeap []SeriesIterator
+type seriesIteratorHeap []chunkenc.Iterator
 
 func (h seriesIteratorHeap) Len() int      { return len(h) }
 func (h seriesIteratorHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
@@ -594,7 +622,7 @@ func (h seriesIteratorHeap) Less(i, j int) bool {
 }
 
 func (h *seriesIteratorHeap) Push(x interface{}) {
-	*h = append(*h, x.(SeriesIterator))
+	*h = append(*h, x.(chunkenc.Iterator))
 }
 
 func (h *seriesIteratorHeap) Pop() interface{} {
@@ -604,3 +632,105 @@ func (h *seriesIteratorHeap) Pop() interface{} {
 	*h = old[0 : n-1]
 	return x
 }
+
+// chainedSeriesChunkIterator implements a series iterated over a list
+// of time-sorted, non-overlapping iterators.
+type chainedSeriesChunkIterator struct {
+	series []Series // series in time order
+
+	i   int
+	cur ChunkIterator
+}
+
+func newChainedSeriesChunkIterator(s ...Series) *chainedSeriesChunkIterator {
+	return &chainedSeriesChunkIterator{
+		series: s,
+		i:      0,
+		cur:    s[0].ChunkIterator(),
+	}
+}
+
+//func (it *chainedSeriesChunkIterator) Seek(t int64) bool {
+//	// We just scan the chained series sequentially as they are already
+//	// pre-selected by relevant time and should be accessed sequentially anyway.
+//	for i, s := range it.series[it.i:] {
+//		cur := s.ChunkIterator()
+//		if !cur.Seek(t) {
+//			continue
+//		}
+//		it.cur = cur
+//		it.i += i
+//		return true
+//	}
+//	return false
+//}
+
+func (it *chainedSeriesChunkIterator) Next() bool {
+	if it.cur.Next() {
+		return true
+	}
+	if it.cur.Err() != nil {
+		return false
+	}
+	if it.i == len(it.series)-1 {
+		return false
+	}
+
+	it.i++
+	it.cur = it.series[it.i].ChunkIterator()
+
+	return it.Next()
+}
+
+func (it *chainedSeriesChunkIterator) At() chunks.Meta {
+	return it.cur.At()
+}
+
+func (it *chainedSeriesChunkIterator) Err() error {
+	return it.cur.Err()
+}
+
+type chunkIterator struct {
+	chunks []chunks.Meta // series in time order
+	idx    int
+}
+
+// NewChunkIterator iterates over chunks.
+func NewChunkIterator(chunks []chunks.Meta) ChunkIterator {
+	return &chunkIterator{
+		chunks: chunks,
+		idx:    -1,
+	}
+}
+
+func (it *chunkIterator) At() chunks.Meta {
+	if it.idx == -1 {
+		return chunks.Meta{}
+	}
+	return it.chunks[it.idx]
+}
+
+func (it *chunkIterator) Next() bool {
+	it.idx++
+	return it.idx < len(it.chunks)
+}
+
+func (it *chunkIterator) Seek(t int64) bool {
+	if it.idx >= len(it.chunks) {
+		return false
+	}
+
+	if it.idx == -1 && !it.Next() {
+		return false
+	}
+
+	// Do binary search between current position and end.
+	pos := sort.Search(len(it.chunks)-it.idx, func(i int) bool {
+		return t <= it.chunks[i+it.idx].MaxTime
+	})
+	it.idx += pos
+
+	return it.idx < len(it.chunks)
+}
+
+func (it *chunkIterator) Err() error { return nil }

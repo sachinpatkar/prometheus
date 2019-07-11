@@ -909,7 +909,7 @@ func (ev *evaluator) rangeEval(f func([]Value, *EvalNodeHelper) Vector, exprs ..
 		}
 	}
 	enh := &EvalNodeHelper{out: make(Vector, 0, biggestLen)}
-	seriess := make(map[uint64]Series, biggestLen) // Output series by series hash.
+	seriess := make(map[uint64]storage.Series, biggestLen) // Output series by series hash.
 	tempNumSamples := ev.currentSamples
 	for ts := ev.startTimestamp; ts <= ev.endTimestamp; ts += ev.interval {
 		if err := contextDone(ev.ctx, "expression evaluation"); err != nil {
@@ -960,7 +960,7 @@ func (ev *evaluator) rangeEval(f func([]Value, *EvalNodeHelper) Vector, exprs ..
 			mat := make(Matrix, len(result))
 			for i, s := range result {
 				s.Point.T = ts
-				mat[i] = Series{Metric: s.Metric, Points: []Point{s.Point}}
+				mat[i] = storage.Series{Metric: s.Metric, Points: []Point{s.Point}}
 			}
 			ev.currentSamples = originalNumSamples + mat.TotalSamples()
 			return mat
@@ -971,7 +971,7 @@ func (ev *evaluator) rangeEval(f func([]Value, *EvalNodeHelper) Vector, exprs ..
 			h := sample.Metric.Hash()
 			ss, ok := seriess[h]
 			if !ok {
-				ss = Series{
+				ss = storage.Series{
 					Metric: sample.Metric,
 					Points: getPointSlice(numSteps),
 				}
@@ -1114,7 +1114,7 @@ func (ev *evaluator) eval(expr Expr) Value {
 		for i, s := range selVS.series {
 			points = points[:0]
 			it.Reset(s.Iterator())
-			ss := Series{
+			ss := storage.Series{
 				// For all range vector functions, the only change to the
 				// output labels is dropping the metric name so just do
 				// it once here.
@@ -1195,7 +1195,7 @@ func (ev *evaluator) eval(expr Expr) Value {
 			}
 
 			return Matrix{
-				Series{
+				storage.Series{
 					Metric: createLabelsForAbsentFunction(e.Args[0]),
 					Points: newp,
 				},
@@ -1275,7 +1275,7 @@ func (ev *evaluator) eval(expr Expr) Value {
 		it := storage.NewBuffer(durationMilliseconds(LookbackDelta))
 		for i, s := range e.series {
 			it.Reset(s.Iterator())
-			ss := Series{
+			ss := storage.Series{
 				Metric: e.series[i].Labels(),
 				Points: getPointSlice(numSteps),
 			}
@@ -1438,7 +1438,7 @@ func (ev *evaluator) matrixSelector(node *MatrixSelector) Matrix {
 			ev.error(err)
 		}
 		it.Reset(s.Iterator())
-		ss := Series{
+		ss := storage.Series{
 			Metric: series[i].Labels(),
 		}
 

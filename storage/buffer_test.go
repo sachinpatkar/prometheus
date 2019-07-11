@@ -14,11 +14,12 @@
 package storage
 
 import (
+	"math"
 	"math/rand"
 	"sort"
 	"testing"
 
-	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 	"github.com/prometheus/prometheus/util/testutil"
 )
 
@@ -106,15 +107,15 @@ func TestBufferedSeriesIterator(t *testing.T) {
 		testutil.Equals(t, ev, v, "value mismatch")
 	}
 
-	it = NewBufferIterator(newListSeriesIterator([]sample{
-		{t: 1, v: 2},
-		{t: 2, v: 3},
-		{t: 3, v: 4},
-		{t: 4, v: 5},
-		{t: 5, v: 6},
-		{t: 99, v: 8},
-		{t: 100, v: 9},
-		{t: 101, v: 10},
+	it = NewBufferIterator(newListSeriesIterator([]tsdbutil.Sample{
+		sample{t: 1, v: 2},
+		sample{t: 2, v: 3},
+		sample{t: 3, v: 4},
+		sample{t: 4, v: 5},
+		sample{t: 5, v: 6},
+		sample{t: 99, v: 8},
+		sample{t: 100, v: 9},
+		sample{t: 101, v: 10},
 	}), 2)
 
 	testutil.Assert(t, it.Seek(-123), "seek failed")
@@ -188,37 +189,22 @@ func (m *mockSeriesIterator) At() (int64, float64) { return m.at() }
 func (m *mockSeriesIterator) Next() bool           { return m.next() }
 func (m *mockSeriesIterator) Err() error           { return m.err() }
 
-type mockSeries struct {
-	labels   func() labels.Labels
-	iterator func() SeriesIterator
-}
-
-func newMockSeries(lset labels.Labels, samples []sample) Series {
-	return &mockSeries{
-		labels: func() labels.Labels {
-			return lset
-		},
-		iterator: func() SeriesIterator {
-			return newListSeriesIterator(samples)
-		},
-	}
-}
-
-func (m *mockSeries) Labels() labels.Labels    { return m.labels() }
-func (m *mockSeries) Iterator() SeriesIterator { return m.iterator() }
-
 type listSeriesIterator struct {
-	list []sample
+	list []tsdbutil.Sample
 	idx  int
 }
 
-func newListSeriesIterator(list []sample) *listSeriesIterator {
+func newListSeriesIterator(list []tsdbutil.Sample) *listSeriesIterator {
 	return &listSeriesIterator{list: list, idx: -1}
 }
 
 func (it *listSeriesIterator) At() (int64, float64) {
+	if it.idx == -1 {
+		return math.MinInt64, 0
+	}
+
 	s := it.list[it.idx]
-	return s.t, s.v
+	return s.T(), s.V()
 }
 
 func (it *listSeriesIterator) Next() bool {
@@ -227,14 +213,19 @@ func (it *listSeriesIterator) Next() bool {
 }
 
 func (it *listSeriesIterator) Seek(t int64) bool {
-	if it.idx == -1 {
-		it.idx = 0
+	if it.idx >= len(it.list) {
+		return false
 	}
+
+	if it.idx == -1 && !it.Next() {
+		return false
+	}
+
 	// Do binary search between current position and end.
-	it.idx = sort.Search(len(it.list)-it.idx, func(i int) bool {
-		s := it.list[i+it.idx]
-		return s.t >= t
+	pos := sort.Search(len(it.list)-it.idx, func(i int) bool {
+		return t <= it.list[i+it.idx].T()
 	})
+	it.idx += pos
 
 	return it.idx < len(it.list)
 }

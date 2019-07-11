@@ -1097,8 +1097,8 @@ func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
 	sortedExternalLabels := make([]prompb.Label, 0, len(externalLabels))
 	for name, value := range externalLabels {
 		sortedExternalLabels = append(sortedExternalLabels, prompb.Label{
-			Name:  string(name),
-			Value: string(value),
+			Name:  name,
+			Value: value,
 		})
 	}
 	sort.Slice(sortedExternalLabels, func(i, j int) bool {
@@ -1122,12 +1122,24 @@ func (api *API) remoteRead(w http.ResponseWriter, r *http.Request) {
 		}
 		for i, query := range req.Queries {
 			err := api.remoteReadQuery(ctx, query, externalLabels, func(querier storage.Querier, selectParams *storage.SelectParams, filteredMatchers []*labels.Matcher) error {
+				// TODO(bwplotka): Benchmarks.
+				//set, _, err := querier.SelectSorted(selectParams, filteredMatchers...)
+				//if err != nil {
+				//	return err
+				//}
+				//
+				//return remote.StreamChunkedReadResponses(
+				//	remote.NewChunkedWriter(w, f),
+				//	int64(i),
+				//	set,
+				//	sortedExternalLabels,
+				//	api.remoteReadMaxBytesInFrame,
+				//)
 				// The streaming API provides sorted series.
-				set, _, err := querier.SelectSorted(selectParams, filteredMatchers...)
+				set, _, err := querier.SelectChunksSorted(selectParams, filteredMatchers...)
 				if err != nil {
 					return err
 				}
-
 				return remote.StreamChunkedReadResponses(
 					remote.NewChunkedWriter(w, f),
 					int64(i),

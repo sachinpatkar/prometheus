@@ -18,6 +18,8 @@ import (
 	"errors"
 
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/tsdb/chunkenc"
+	"github.com/prometheus/prometheus/tsdb/chunks"
 )
 
 // The errors exposed.
@@ -49,15 +51,17 @@ type Queryable interface {
 	Querier(ctx context.Context, mint, maxt int64) (Querier, error)
 }
 
-// Querier provides reading access to time series data.
+// Querier provides querying access over time series data of a fixed
+// time range.
 type Querier interface {
 	// Select returns a set of series that matches the given label matchers.
 	Select(*SelectParams, ...*labels.Matcher) (SeriesSet, Warnings, error)
 
-	// SelectSorted returns a sorted set of series that matches the given label matchers.
+	// SelectSorted returns a sorted set of series that matches the given label matcher.
 	SelectSorted(*SelectParams, ...*labels.Matcher) (SeriesSet, Warnings, error)
 
 	// LabelValues returns all potential values for a label name.
+	// It is not safe to use the strings beyond the lifefime of the querier.
 	LabelValues(name string) ([]string, Warnings, error)
 
 	// LabelNames returns all the unique label names present in the block in sorted order.
@@ -108,25 +112,30 @@ type SeriesSet interface {
 	Err() error
 }
 
-// Series represents a single time series.
+// Series exposes a single time series and allows to iterate over samples as well chunks.
 type Series interface {
 	// Labels returns the complete set of labels identifying the series.
 	Labels() labels.Labels
 
 	// Iterator returns a new iterator of the data of the series.
-	Iterator() SeriesIterator
+	Iterator() chunkenc.Iterator
+
+	// ChunkIterator returns a new iterator that iterates over non-overlapping chunks.
+	// We expect tombstones to be applied and all chunks populated and closed if they were still
+	// open in head. Chunk references might be invalid.
+	ChunkIterator() ChunkIterator
 }
 
-// SeriesIterator iterates over the data of a time series.
-type SeriesIterator interface {
-	// Seek advances the iterator forward to the value at or after
-	// the given timestamp.
-	Seek(t int64) bool
-	// At returns the current timestamp/value pair.
-	At() (t int64, v float64)
+// ChunkIterator iterates over the chunk of a time series.
+type ChunkIterator interface {
+	//// Seek advances the iterator forward to the given timestamp.
+	//// It advances to the chunk with min time at t or first chunk with min time after t.
+	//Seek(t int64) bool
+	// At returns the current meta.
+	At() chunks.Meta
 	// Next advances the iterator by one.
 	Next() bool
-	// Err returns the current error.
+	// Err returns optional error if Next is false.
 	Err() error
 }
 

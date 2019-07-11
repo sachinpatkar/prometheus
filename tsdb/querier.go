@@ -14,13 +14,14 @@
 package tsdb
 
 import (
-	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/pkg/errors"
 	"github.com/prometheus/prometheus/pkg/labels"
+	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
 	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
@@ -28,52 +29,25 @@ import (
 	"github.com/prometheus/prometheus/tsdb/tombstones"
 )
 
-// Querier provides querying access over time series data of a fixed
-// time range.
-type Querier interface {
-	// Select returns a set of series that matches the given label matchers.
-	Select(...*labels.Matcher) (SeriesSet, error)
-
-	// SelectSorted returns a sorted set of series that matches the given label matcher.
-	SelectSorted(...*labels.Matcher) (SeriesSet, error)
-
-	// LabelValues returns all potential values for a label name.
-	// It is not safe to use the strings beyond the lifefime of the querier.
-	LabelValues(string) ([]string, error)
-
-	// LabelNames returns all the unique label names present in the block in sorted order.
-	LabelNames() ([]string, error)
-
-	// Close releases the resources of the Querier.
-	Close() error
-}
-
-// Series exposes a single time series.
-type Series interface {
-	// Labels returns the complete set of labels identifying the series.
-	Labels() labels.Labels
-
-	// Iterator returns a new iterator of the data of the series.
-	Iterator() SeriesIterator
-}
-
 // querier aggregates querying results from time blocks within
 // a single partition.
 type querier struct {
-	blocks []Querier
+	blocks []storage.Querier
 }
 
-func (q *querier) LabelValues(n string) ([]string, error) {
+func (q *querier) LabelValues(n string) ([]string, storage.Warnings, error) {
 	return q.lvals(q.blocks, n)
 }
 
 // LabelNames returns all the unique label names present querier blocks.
-func (q *querier) LabelNames() ([]string, error) {
+func (q *querier) LabelNames() ([]string, storage.Warnings, error) {
 	labelNamesMap := make(map[string]struct{})
+	var ws storage.Warnings
 	for _, b := range q.blocks {
-		names, err := b.LabelNames()
+		names, w, err := b.LabelNames()
+		ws = append(ws, w...)
 		if err != nil {
-			return nil, errors.Wrap(err, "LabelNames() from Querier")
+			return nil, ws, errors.Wrap(err, "LabelNames() from Querier")
 		}
 		for _, name := range names {
 			labelNamesMap[name] = struct{}{}
@@ -86,51 +60,56 @@ func (q *querier) LabelNames() ([]string, error) {
 	}
 	sort.Strings(labelNames)
 
-	return labelNames, nil
+	return labelNames, ws, nil
 }
 
-func (q *querier) lvals(qs []Querier, n string) ([]string, error) {
+func (q *querier) lvals(qs []storage.Querier, n string) ([]string, storage.Warnings, error) {
+	var ws storage.Warnings
 	if len(qs) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 	if len(qs) == 1 {
 		return qs[0].LabelValues(n)
 	}
 	l := len(qs) / 2
-	s1, err := q.lvals(qs[:l], n)
+	s1, w, err := q.lvals(qs[:l], n)
+	ws = append(ws, w...)
 	if err != nil {
-		return nil, err
+		return nil, ws, err
 	}
-	s2, err := q.lvals(qs[l:], n)
+	s2, w2, err := q.lvals(qs[l:], n)
+	ws = append(ws, w2...)
 	if err != nil {
-		return nil, err
+		return nil, ws, err
 	}
-	return mergeStrings(s1, s2), nil
+	return mergeStrings(s1, s2), ws, nil
 }
 
-func (q *querier) Select(ms ...*labels.Matcher) (SeriesSet, error) {
+func (q *querier) Select(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
 	if len(q.blocks) != 1 {
-		return q.SelectSorted(ms...)
+		return q.SelectSorted(p, ms...)
 	}
 	// Sorting Head series is slow, and unneeded when only the
 	// Head is being queried. Sorting blocks is a noop.
-	return q.blocks[0].Select(ms...)
+	return q.blocks[0].Select(p, ms...)
 }
 
-func (q *querier) SelectSorted(ms ...*labels.Matcher) (SeriesSet, error) {
+func (q *querier) SelectSorted(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+	var ws storage.Warnings
 	if len(q.blocks) == 0 {
-		return EmptySeriesSet(), nil
+		return storage.EmptySeriesSet(), nil, nil
 	}
-	ss := make([]SeriesSet, len(q.blocks))
+	ss := make([]storage.SeriesSet, len(q.blocks))
 	for i, b := range q.blocks {
-		s, err := b.SelectSorted(ms...)
+		s, w, err := b.SelectSorted(p, ms...)
+		ws = append(ws, w...)
 		if err != nil {
-			return nil, err
+			return nil, ws, err
 		}
 		ss[i] = s
 	}
 
-	return NewMergedSeriesSet(ss), nil
+	return storage.NewMergeSeriesSet(ss...), ws, nil
 }
 
 func (q *querier) Close() error {
@@ -148,36 +127,39 @@ type verticalQuerier struct {
 	querier
 }
 
-func (q *verticalQuerier) Select(ms ...*labels.Matcher) (SeriesSet, error) {
-	return q.sel(q.blocks, ms)
+func (q *verticalQuerier) Select(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+	return q.sel(p, q.blocks, ms)
 }
 
-func (q *verticalQuerier) SelectSorted(ms ...*labels.Matcher) (SeriesSet, error) {
-	return q.sel(q.blocks, ms)
+func (q *verticalQuerier) SelectSorted(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+	return q.sel(p, q.blocks, ms)
 }
 
-func (q *verticalQuerier) sel(qs []Querier, ms []*labels.Matcher) (SeriesSet, error) {
+func (q *verticalQuerier) sel(p *storage.SelectParams, qs []storage.Querier, ms []*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+	var ws storage.Warnings
 	if len(qs) == 0 {
-		return EmptySeriesSet(), nil
+		return storage.EmptySeriesSet(), nil, nil
 	}
 	if len(qs) == 1 {
-		return qs[0].SelectSorted(ms...)
+		return qs[0].SelectSorted(p, ms...)
 	}
 	l := len(qs) / 2
 
-	a, err := q.sel(qs[:l], ms)
+	a, w, err := q.sel(p, qs[:l], ms)
+	ws = append(ws, w...)
 	if err != nil {
-		return nil, err
+		return nil, ws, err
 	}
-	b, err := q.sel(qs[l:], ms)
+	b, w, err := q.sel(p, qs[l:], ms)
+	ws = append(ws, w...)
 	if err != nil {
-		return nil, err
+		return nil, ws, err
 	}
-	return newMergedVerticalSeriesSet(a, b), nil
+	return newMergedVerticalSeriesSet(a, b), ws, nil
 }
 
 // NewBlockQuerier returns a querier against the reader.
-func NewBlockQuerier(b BlockReader, mint, maxt int64) (Querier, error) {
+func NewBlockQuerier(b BlockReader, mint, maxt int64) (storage.Querier, error) {
 	indexr, err := b.Index()
 	if err != nil {
 		return nil, errors.Wrapf(err, "open index reader")
@@ -213,52 +195,24 @@ type blockQuerier struct {
 	mint, maxt int64
 }
 
-func (q *blockQuerier) Select(ms ...*labels.Matcher) (SeriesSet, error) {
-	base, err := LookupChunkSeries(q.index, q.tombstones, ms...)
-	if err != nil {
-		return nil, err
-	}
-	return &blockSeriesSet{
-		set: &populatedChunkSeries{
-			set:    base,
-			chunks: q.chunks,
-			mint:   q.mint,
-			maxt:   q.maxt,
-		},
-
-		mint: q.mint,
-		maxt: q.maxt,
-	}, nil
+func (q *blockQuerier) Select(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+	s, err := q.sel(false, p, ms...)
+	return s, nil, err
 }
 
-func (q *blockQuerier) SelectSorted(ms ...*labels.Matcher) (SeriesSet, error) {
-	base, err := LookupChunkSeriesSorted(q.index, q.tombstones, ms...)
-	if err != nil {
-		return nil, err
-	}
-	return &blockSeriesSet{
-		set: &populatedChunkSeries{
-			set:    base,
-			chunks: q.chunks,
-			mint:   q.mint,
-			maxt:   q.maxt,
-		},
-
-		mint: q.mint,
-		maxt: q.maxt,
-	}, nil
+func (q *blockQuerier) SelectSorted(p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, storage.Warnings, error) {
+	s, err := q.sel(true, p, ms...)
+	return s, nil, err
 }
 
-func (q *blockQuerier) LabelValues(name string) ([]string, error) {
-	return q.index.LabelValues(name)
+func (q *blockQuerier) LabelValues(name string) ([]string, storage.Warnings, error) {
+	s, err := q.index.LabelValues(name)
+	return s, nil, err
 }
 
-func (q *blockQuerier) LabelNames() ([]string, error) {
-	return q.index.LabelNames()
-}
-
-func (q *blockQuerier) LabelValuesFor(string, labels.Label) ([]string, error) {
-	return nil, fmt.Errorf("not implemented")
+func (q *blockQuerier) LabelNames() ([]string, storage.Warnings, error) {
+	s, err := q.index.LabelNames()
+	return s, nil, err
 }
 
 func (q *blockQuerier) Close() error {
@@ -495,156 +449,20 @@ func mergeStrings(a, b []string) []string {
 	return res
 }
 
-// SeriesSet contains a set of series.
-type SeriesSet interface {
-	Next() bool
-	At() Series
-	Err() error
-}
-
-var emptySeriesSet = errSeriesSet{}
-
-// EmptySeriesSet returns a series set that's always empty.
-func EmptySeriesSet() SeriesSet {
-	return emptySeriesSet
-}
-
-// mergedSeriesSet returns a series sets slice as a single series set. The input series sets
-// must be sorted and sequential in time.
-type mergedSeriesSet struct {
-	all  []SeriesSet
-	buf  []SeriesSet // A buffer for keeping the order of SeriesSet slice during forwarding the SeriesSet.
-	ids  []int       // The indices of chosen SeriesSet for the current run.
-	done bool
-	err  error
-	cur  Series
-}
-
-func NewMergedSeriesSet(all []SeriesSet) SeriesSet {
-	if len(all) == 1 {
-		return all[0]
-	}
-	s := &mergedSeriesSet{all: all}
-	// Initialize first elements of all sets as Next() needs
-	// one element look-ahead.
-	s.nextAll()
-	if len(s.all) == 0 {
-		s.done = true
-	}
-
-	return s
-}
-
-func (s *mergedSeriesSet) At() Series {
-	return s.cur
-}
-
-func (s *mergedSeriesSet) Err() error {
-	return s.err
-}
-
-// nextAll is to call Next() for all SeriesSet.
-// Because the order of the SeriesSet slice will affect the results,
-// we need to use an buffer slice to hold the order.
-func (s *mergedSeriesSet) nextAll() {
-	s.buf = s.buf[:0]
-	for _, ss := range s.all {
-		if ss.Next() {
-			s.buf = append(s.buf, ss)
-		} else if ss.Err() != nil {
-			s.done = true
-			s.err = ss.Err()
-			break
-		}
-	}
-	s.all, s.buf = s.buf, s.all
-}
-
-// nextWithID is to call Next() for the SeriesSet with the indices of s.ids.
-// Because the order of the SeriesSet slice will affect the results,
-// we need to use an buffer slice to hold the order.
-func (s *mergedSeriesSet) nextWithID() {
-	if len(s.ids) == 0 {
-		return
-	}
-
-	s.buf = s.buf[:0]
-	i1 := 0
-	i2 := 0
-	for i1 < len(s.all) {
-		if i2 < len(s.ids) && i1 == s.ids[i2] {
-			if !s.all[s.ids[i2]].Next() {
-				if s.all[s.ids[i2]].Err() != nil {
-					s.done = true
-					s.err = s.all[s.ids[i2]].Err()
-					break
-				}
-				i2++
-				i1++
-				continue
-			}
-			i2++
-		}
-		s.buf = append(s.buf, s.all[i1])
-		i1++
-	}
-	s.all, s.buf = s.buf, s.all
-}
-
-func (s *mergedSeriesSet) Next() bool {
-	if s.done {
-		return false
-	}
-
-	s.nextWithID()
-	if s.done {
-		return false
-	}
-	s.ids = s.ids[:0]
-	if len(s.all) == 0 {
-		s.done = true
-		return false
-	}
-
-	// Here we are looking for a set of series sets with the lowest labels,
-	// and we will cache their indexes in s.ids.
-	s.ids = append(s.ids, 0)
-	for i := 1; i < len(s.all); i++ {
-		cmp := labels.Compare(s.all[s.ids[0]].At().Labels(), s.all[i].At().Labels())
-		if cmp > 0 {
-			s.ids = s.ids[:1]
-			s.ids[0] = i
-		} else if cmp == 0 {
-			s.ids = append(s.ids, i)
-		}
-	}
-
-	if len(s.ids) > 1 {
-		series := make([]Series, len(s.ids))
-		for i, idx := range s.ids {
-			series[i] = s.all[idx].At()
-		}
-		s.cur = &chainedSeries{series: series}
-	} else {
-		s.cur = s.all[s.ids[0]].At()
-	}
-	return true
-}
-
 type mergedVerticalSeriesSet struct {
-	a, b         SeriesSet
-	cur          Series
+	a, b         storage.SeriesSet
+	cur          storage.Series
 	adone, bdone bool
 }
 
 // NewMergedVerticalSeriesSet takes two series sets as a single series set.
 // The input series sets must be sorted and
 // the time ranges of the series can be overlapping.
-func NewMergedVerticalSeriesSet(a, b SeriesSet) SeriesSet {
+func NewMergedVerticalSeriesSet(a, b storage.SeriesSet) storage.SeriesSet {
 	return newMergedVerticalSeriesSet(a, b)
 }
 
-func newMergedVerticalSeriesSet(a, b SeriesSet) *mergedVerticalSeriesSet {
+func newMergedVerticalSeriesSet(a, b storage.SeriesSet) *mergedVerticalSeriesSet {
 	s := &mergedVerticalSeriesSet{a: a, b: b}
 	// Initialize first elements of both sets as Next() needs
 	// one element look-ahead.
@@ -654,7 +472,7 @@ func newMergedVerticalSeriesSet(a, b SeriesSet) *mergedVerticalSeriesSet {
 	return s
 }
 
-func (s *mergedVerticalSeriesSet) At() Series {
+func (s *mergedVerticalSeriesSet) At() storage.Series {
 	return s.cur
 }
 
@@ -690,71 +508,72 @@ func (s *mergedVerticalSeriesSet) Next() bool {
 		s.cur = s.a.At()
 		s.adone = !s.a.Next()
 	} else {
-		s.cur = &verticalChainedSeries{series: []Series{s.a.At(), s.b.At()}}
+		s.cur = &verticalChainedSeries{series: []storage.Series{s.a.At(), s.b.At()}}
 		s.adone = !s.a.Next()
 		s.bdone = !s.b.Next()
 	}
 	return true
 }
 
-// ChunkSeriesSet exposes the chunks and intervals of a series instead of the
-// actual series itself.
-type ChunkSeriesSet interface {
-	Next() bool
-	At() (labels.Labels, []chunks.Meta, tombstones.Intervals)
-	Err() error
-}
-
-// baseChunkSeries loads the label set and chunk references for a postings
+// baseSeriesSet loads the label set and chunk references for a postings
 // list from an index. It filters out series that have labels set that should be unset.
-type baseChunkSeries struct {
+type blockSeriesSet struct {
 	p          index.Postings
 	index      IndexReader
 	tombstones tombstones.Reader
+	chunks     ChunkReader
 
+	mint, maxt int64
+
+	curr      storage.Series
 	lset      labels.Labels
-	chks      []chunks.Meta
 	intervals tombstones.Intervals
-	err       error
+
+	chks []chunks.Meta
+	err  error
 }
 
-// LookupChunkSeries retrieves all series for the given matchers and returns a ChunkSeriesSet
-// over them. It drops chunks based on tombstones in the given reader.
-func LookupChunkSeries(ir IndexReader, tr tombstones.Reader, ms ...*labels.Matcher) (ChunkSeriesSet, error) {
-	return lookupChunkSeries(false, ir, tr, ms...)
-}
-
-// LookupChunkSeries retrieves all series for the given matchers and returns a ChunkSeriesSet
-// over them. It drops chunks based on tombstones in the given reader. Series will be in order.
-func LookupChunkSeriesSorted(ir IndexReader, tr tombstones.Reader, ms ...*labels.Matcher) (ChunkSeriesSet, error) {
-	return lookupChunkSeries(true, ir, tr, ms...)
-}
-
-func lookupChunkSeries(sorted bool, ir IndexReader, tr tombstones.Reader, ms ...*labels.Matcher) (ChunkSeriesSet, error) {
+// LookupChunkSeriesSortedSet retrieves all series for the given matchers and returns a ChunkSeriesSet
+// over them. It drops chunks based on tombstones in the given reader. Series will be in order based on flag.
+func (q *blockQuerier) sel(sorted bool, p *storage.SelectParams, ms ...*labels.Matcher) (storage.SeriesSet, error) {
+	mint := q.mint
+	maxt := q.maxt
+	if p != nil {
+		mint = p.Start
+		maxt = p.End
+	}
+	tr := q.tombstones
 	if tr == nil {
 		tr = tombstones.NewMemTombstones()
 	}
-	p, err := PostingsForMatchers(ir, ms...)
+	postings, err := PostingsForMatchers(q.index, ms...)
 	if err != nil {
 		return nil, err
 	}
 	if sorted {
-		p = ir.SortedPostings(p)
+		postings = q.index.SortedPostings(postings)
 	}
-	return &baseChunkSeries{
+	return newBlockSeriesSet(mint, maxt, q.index, q.chunks, tr, postings), nil
+}
+
+func newBlockSeriesSet(mint, maxt int64, i IndexReader, c ChunkReader, t tombstones.Reader, p index.Postings) *blockSeriesSet {
+	return &blockSeriesSet{
 		p:          p,
-		index:      ir,
-		tombstones: tr,
-	}, nil
+		index:      i,
+		chunks:     c,
+		tombstones: t,
+		mint:       mint,
+		maxt:       maxt,
+	}
 }
 
-func (s *baseChunkSeries) At() (labels.Labels, []chunks.Meta, tombstones.Intervals) {
-	return s.lset, s.chks, s.intervals
+func (s *blockSeriesSet) At() storage.Series {
+	return s.curr
 }
 
-func (s *baseChunkSeries) Err() error { return s.err }
+func (s *blockSeriesSet) Err() error { return s.err }
 
-func (s *baseChunkSeries) Next() bool {
+func (s *blockSeriesSet) Next() bool {
 	var (
 		lset     = make(labels.Labels, len(s.lset))
 		chkMetas = make([]chunks.Meta, len(s.chks))
@@ -768,7 +587,7 @@ func (s *baseChunkSeries) Next() bool {
 			if errors.Cause(err) == ErrNotFound {
 				continue
 			}
-			s.err = err
+			s.err = errors.Wrapf(err, "get series %d", ref)
 			return false
 		}
 
@@ -791,7 +610,13 @@ func (s *baseChunkSeries) Next() bool {
 
 			s.chks = chks
 		}
-
+		s.curr = &chunkSeries{
+			lset:   s.lset,
+			chks:   s.chks,
+			mint:   s.mint,
+			maxt:   s.maxt,
+			chunks: s.chunks,
+		}
 		return true
 	}
 	if err := s.p.Err(); err != nil {
@@ -800,112 +625,140 @@ func (s *baseChunkSeries) Next() bool {
 	return false
 }
 
-// populatedChunkSeries loads chunk data from a store for a set of series
-// with known chunk references. It filters out chunks that do not fit the
-// given time range.
-type populatedChunkSeries struct {
-	set        ChunkSeriesSet
+// populatedChunkIterator allows to iterate over chunks.
+// Returned chunk is populated with known chunk reference, tombstones applied and closed if it comes from head.
+// It filters out chunks that do not fit the given time range.
+type populatedChunkIterator struct {
+	chIter     storage.ChunkIterator
 	chunks     ChunkReader
 	mint, maxt int64
 
-	err       error
-	chks      []chunks.Meta
+	curr      chunks.Meta
 	lset      labels.Labels
 	intervals tombstones.Intervals
+	err       error
+
+	bufDelIter *deletedIterator
 }
 
-func (s *populatedChunkSeries) At() (labels.Labels, []chunks.Meta, tombstones.Intervals) {
-	return s.lset, s.chks, s.intervals
+func newPopulatedChunkIterator(
+	chIter storage.ChunkIterator,
+	chunks ChunkReader,
+	mint, maxt int64,
+	intervals tombstones.Intervals,
+) storage.ChunkIterator {
+	return &populatedChunkIterator{
+		chIter:    chIter,
+		chunks:    chunks,
+		mint:      mint,
+		maxt:      maxt,
+		intervals: intervals,
+	}
 }
 
-func (s *populatedChunkSeries) Err() error { return s.err }
+func (s *populatedChunkIterator) At() chunks.Meta { return s.curr }
 
-func (s *populatedChunkSeries) Next() bool {
-	for s.set.Next() {
-		lset, chks, dranges := s.set.At()
+func (s *populatedChunkIterator) Err() error { return s.err }
 
-		for len(chks) > 0 {
-			if chks[0].MaxTime >= s.mint {
-				break
-			}
-			chks = chks[1:]
+func (s *populatedChunkIterator) Next() bool {
+	intervalsWithCloseChunkDRange := append(s.intervals, tombstones.Interval{Mint: s.maxt, Maxt: math.MaxInt64})
+
+	for s.chIter.Next() {
+		s.curr = s.chIter.At()
+
+		// Chunks have both closed time range [start, end] vs block are half-open [start, end)
+		if s.curr.MaxTime < s.mint {
+			break
 		}
 
-		// This is to delete in place while iterating.
-		for i, rlen := 0, len(chks); i < rlen; i++ {
-			j := i - (rlen - len(chks))
-			c := &chks[j]
-
-			// Break out at the first chunk that has no overlap with mint, maxt.
-			if c.MinTime > s.maxt {
-				chks = chks[:j]
-				break
-			}
-
-			c.Chunk, s.err = s.chunks.Chunk(c.Ref)
-			if s.err != nil {
-				// This means that the chunk has be garbage collected. Remove it from the list.
-				if s.err == ErrNotFound {
-					s.err = nil
-					// Delete in-place.
-					s.chks = append(chks[:j], chks[j+1:]...)
-				}
-				return false
-			}
-		}
-
-		if len(chks) == 0 {
+		if s.curr.MinTime <= s.maxt {
 			continue
 		}
 
-		s.lset = lset
-		s.chks = chks
-		s.intervals = dranges
+		s.curr.Chunk, s.err = s.chunks.Chunk(s.curr.Ref)
+		if s.err != nil {
+			// This means that the chunk has be garbage collected. Remove it from the list.
+			if s.err == ErrNotFound {
+				s.err = nil
+			}
+			continue
+		}
 
+		dranges := s.intervals
+
+		// Re-encode head chunks that are still open (being appended to) or
+		// outside the compacted MaxTime range.
+		// The chunk.Bytes() method is not safe for open chunks hence the re-encoding.
+		// This happens when snapshotting the head block.
+		//
+		// Block time range is half-open: [meta.MinTime, meta.MaxTime) and
+		// chunks are closed hence the chk.MaxTime >= meta.MaxTime check.
+		//
+		// TODO Think how to avoid the typecasting to verify when it is head block.
+		if _, isHeadChunk := s.curr.Chunk.(*safeChunk); isHeadChunk && s.curr.MaxTime >= s.maxt {
+			dranges = intervalsWithCloseChunkDRange
+
+			// Sanity check for disk blocks.
+			// chk.MaxTime == meta.MaxTime shouldn't happen as well, but will brake many users so not checking for that.
+		} else if s.curr.MinTime < s.mint || s.curr.MaxTime > s.maxt {
+			s.err = errors.Errorf("found chunk with minTime: %d maxTime: %d outside of compacted minTime: %d maxTime: %d",
+				s.curr.MinTime, s.curr.MaxTime, s.mint, s.maxt)
+			return false
+		}
+
+		if len(dranges) > 0 {
+			// Re-encode the chunk to not have deleted values.
+			if !s.curr.OverlapsClosedInterval(dranges[0].Mint, dranges[len(dranges)-1].Maxt) {
+				continue
+			}
+			newChunk := chunkenc.NewXORChunk()
+			app, err := newChunk.Appender()
+			if err != nil {
+				s.err = err
+				return false
+			}
+
+			if s.bufDelIter == nil {
+				s.bufDelIter = &deletedIterator{
+					intervals: s.intervals,
+				}
+			}
+			s.bufDelIter.it = s.curr.Chunk.Iterator(s.bufDelIter.it)
+			s.bufDelIter.intervals = dranges
+
+			var (
+				t int64
+				v float64
+			)
+			for s.bufDelIter.Next() {
+				t, v = s.bufDelIter.At()
+				app.Append(t, v)
+			}
+			if err := s.bufDelIter.Err(); err != nil {
+				s.err = errors.Wrap(err, "iterate chunk while re-encoding")
+				return false
+			}
+
+			if newChunk.NumSamples() == 0 {
+				continue
+			}
+			s.curr.Chunk = newChunk
+			s.curr.MaxTime = t
+		}
 		return true
 	}
-	if err := s.set.Err(); err != nil {
+	if err := s.chIter.Err(); err != nil {
 		s.err = err
 	}
 	return false
 }
 
-// blockSeriesSet is a set of series from an inverted index query.
-type blockSeriesSet struct {
-	set ChunkSeriesSet
-	err error
-	cur Series
-
-	mint, maxt int64
-}
-
-func (s *blockSeriesSet) Next() bool {
-	for s.set.Next() {
-		lset, chunks, dranges := s.set.At()
-		s.cur = &chunkSeries{
-			labels: lset,
-			chunks: chunks,
-			mint:   s.mint,
-			maxt:   s.maxt,
-
-			intervals: dranges,
-		}
-		return true
-	}
-	if s.set.Err() != nil {
-		s.err = s.set.Err()
-	}
-	return false
-}
-
-func (s *blockSeriesSet) At() Series { return s.cur }
-func (s *blockSeriesSet) Err() error { return s.err }
-
 // chunkSeries is a series that is backed by a sequence of chunks holding
 // time series data.
 type chunkSeries struct {
-	labels labels.Labels
-	chunks []chunks.Meta // in-order chunk refs
+	lset   labels.Labels
+	chks   []chunks.Meta // in-order chunk refs
+	chunks ChunkReader
 
 	mint, maxt int64
 
@@ -913,144 +766,77 @@ type chunkSeries struct {
 }
 
 func (s *chunkSeries) Labels() labels.Labels {
-	return s.labels
+	return s.lset
 }
 
-func (s *chunkSeries) Iterator() SeriesIterator {
-	return newChunkSeriesIterator(s.chunks, s.intervals, s.mint, s.maxt)
+func (s *chunkSeries) Iterator() chunkenc.Iterator {
+	return newChunkSeriesIterator(s.chks, s.intervals, s.mint, s.maxt)
 }
 
-// SeriesIterator iterates over the data of a time series.
-type SeriesIterator interface {
-	// Seek advances the iterator forward to the given timestamp.
-	// If there's no value exactly at t, it advances to the first value
-	// after t.
-	Seek(t int64) bool
-	// At returns the current timestamp/value pair.
-	At() (t int64, v float64)
-	// Next advances the iterator by one.
-	Next() bool
-	// Err returns the current error.
-	Err() error
-}
-
-// chainedSeries implements a series for a list of time-sorted series.
-// They all must have the same labels.
-type chainedSeries struct {
-	series []Series
-}
-
-func (s *chainedSeries) Labels() labels.Labels {
-	return s.series[0].Labels()
-}
-
-func (s *chainedSeries) Iterator() SeriesIterator {
-	return newChainedSeriesIterator(s.series...)
-}
-
-// chainedSeriesIterator implements a series iterator over a list
-// of time-sorted, non-overlapping iterators.
-type chainedSeriesIterator struct {
-	series []Series // series in time order
-
-	i   int
-	cur SeriesIterator
-}
-
-func newChainedSeriesIterator(s ...Series) *chainedSeriesIterator {
-	return &chainedSeriesIterator{
-		series: s,
-		i:      0,
-		cur:    s[0].Iterator(),
-	}
-}
-
-func (it *chainedSeriesIterator) Seek(t int64) bool {
-	// We just scan the chained series sequentially as they are already
-	// pre-selected by relevant time and should be accessed sequentially anyway.
-	for i, s := range it.series[it.i:] {
-		cur := s.Iterator()
-		if !cur.Seek(t) {
-			continue
-		}
-		it.cur = cur
-		it.i += i
-		return true
-	}
-	return false
-}
-
-func (it *chainedSeriesIterator) Next() bool {
-	if it.cur.Next() {
-		return true
-	}
-	if err := it.cur.Err(); err != nil {
-		return false
-	}
-	if it.i == len(it.series)-1 {
-		return false
-	}
-
-	it.i++
-	it.cur = it.series[it.i].Iterator()
-
-	return it.Next()
-}
-
-func (it *chainedSeriesIterator) At() (t int64, v float64) {
-	return it.cur.At()
-}
-
-func (it *chainedSeriesIterator) Err() error {
-	return it.cur.Err()
+func (s *chunkSeries) ChunkIterator() storage.ChunkIterator {
+	return newPopulatedChunkIterator(storage.NewChunkIterator(s.chks), s.chunks, s.mint, s.maxt, s.intervals)
 }
 
 // verticalChainedSeries implements a series for a list of time-sorted, time-overlapping series.
 // They all must have the same labels.
 type verticalChainedSeries struct {
-	series []Series
+	series []storage.Series
 }
 
 func (s *verticalChainedSeries) Labels() labels.Labels {
 	return s.series[0].Labels()
 }
 
-func (s *verticalChainedSeries) Iterator() SeriesIterator {
+func (s *verticalChainedSeries) Iterator() chunkenc.Iterator {
 	return newVerticalMergeSeriesIterator(s.series...)
+}
+
+func (s *verticalChainedSeries) ChunkIterator() storage.ChunkIterator {
+	return newVerticalMergeChunkIterator(s.series...)
 }
 
 // verticalMergeSeriesIterator implements a series iterator over a list
 // of time-sorted, time-overlapping iterators.
 type verticalMergeSeriesIterator struct {
-	a, b                  SeriesIterator
+	a, b                  chunkenc.Iterator
 	aok, bok, initialized bool
 
 	curT int64
 	curV float64
 }
 
-func newVerticalMergeSeriesIterator(s ...Series) SeriesIterator {
+func newVerticalMergeSeriesIterator(s ...storage.Series) chunkenc.Iterator {
 	if len(s) == 1 {
 		return s[0].Iterator()
 	} else if len(s) == 2 {
 		return &verticalMergeSeriesIterator{
-			a: s[0].Iterator(),
-			b: s[1].Iterator(),
+			a:    s[0].Iterator(),
+			b:    s[1].Iterator(),
+			curT: math.MinInt64,
 		}
 	}
 	return &verticalMergeSeriesIterator{
-		a: s[0].Iterator(),
-		b: newVerticalMergeSeriesIterator(s[1:]...),
+		a:    s[0].Iterator(),
+		b:    newVerticalMergeSeriesIterator(s[1:]...),
+		curT: math.MinInt64,
 	}
 }
 
 func (it *verticalMergeSeriesIterator) Seek(t int64) bool {
+	if it.initialized && it.curT >= t {
+		return true
+	}
+
 	it.aok, it.bok = it.a.Seek(t), it.b.Seek(t)
 	it.initialized = true
 	return it.Next()
 }
 
 func (it *verticalMergeSeriesIterator) Next() bool {
+	if it.Err() != nil {
+		return false
+	}
+
 	if !it.initialized {
 		it.aok = it.a.Next()
 		it.bok = it.b.Next()
@@ -1093,6 +879,145 @@ func (it *verticalMergeSeriesIterator) At() (t int64, v float64) {
 }
 
 func (it *verticalMergeSeriesIterator) Err() error {
+	if it.a.Err() != nil {
+		return it.a.Err()
+	}
+	return it.b.Err()
+}
+
+// verticalMergeChunkIterator implements a ChunkIterator over a list
+// of time-sorted, time-overlapping chunk iterators for the same labels (same series).
+// Any overlap in chunks will be merged using verticalMergeSeriesIterator.
+type verticalMergeChunkIterator struct {
+	a, b                  storage.ChunkIterator
+	aok, bok, initialized bool
+
+	curMeta chunks.Meta
+	err     error
+
+	aReuseIter, bReuseIter chunkenc.Iterator
+}
+
+func newVerticalMergeChunkIterator(s ...storage.Series) storage.ChunkIterator {
+	if len(s) == 1 {
+		return s[0].ChunkIterator()
+	} else if len(s) == 2 {
+		return &verticalMergeChunkIterator{
+			a: s[0].ChunkIterator(),
+			b: s[1].ChunkIterator(),
+		}
+	}
+	return &verticalMergeChunkIterator{
+		a: s[0].ChunkIterator(),
+		b: newVerticalMergeChunkIterator(s[1:]...),
+	}
+}
+
+func (it *verticalMergeChunkIterator) Next() bool {
+	if it.Err() != nil {
+		return false
+	}
+
+	if !it.initialized {
+		it.aok = it.a.Next()
+		it.bok = it.b.Next()
+		it.initialized = true
+	}
+
+	if !it.aok && !it.bok {
+		return false
+	}
+
+	if !it.aok {
+		it.curMeta = it.b.At()
+		it.bok = it.b.Next()
+		return true
+	}
+	if !it.bok {
+		it.curMeta = it.a.At()
+		it.aok = it.a.Next()
+		return true
+	}
+
+	aCurMeta := it.a.At()
+	bCurMeta := it.b.At()
+
+	if aCurMeta.MaxTime < bCurMeta.MinTime {
+		it.curMeta = aCurMeta
+		it.aok = it.a.Next()
+		return true
+	}
+
+	if bCurMeta.MaxTime < aCurMeta.MinTime {
+		it.curMeta = bCurMeta
+		it.bok = it.b.Next()
+		return true
+	}
+
+	it.curMeta, it.err = mergeOverlappingChunks(aCurMeta, bCurMeta, it.aReuseIter, it.bReuseIter)
+	if it.err != nil {
+		return false
+	}
+
+	it.aok = it.a.Next()
+	it.bok = it.b.Next()
+	return true
+}
+
+// TODO: https://github.com/prometheus/tsdb/issues/670
+func mergeOverlappingChunks(a, b chunks.Meta, aReuseIter, bReuseIter chunkenc.Iterator) (chunks.Meta, error) {
+	chk := chunkenc.NewXORChunk()
+	app, err := chk.Appender()
+	if err != nil {
+		return chunks.Meta{}, err
+	}
+	seriesIter := &verticalMergeSeriesIterator{
+		a: a.Chunk.Iterator(aReuseIter),
+		b: b.Chunk.Iterator(bReuseIter),
+	}
+
+	mint := int64(math.MaxInt64)
+	maxt := int64(math.MinInt64)
+
+	// TODO: This can end up being up to 240 samples per chunk, so we need to have a case to split to two.
+	for seriesIter.Next() {
+		t, v := seriesIter.At()
+		app.Append(t, v)
+
+		maxt = t
+		if mint == math.MaxInt64 {
+			mint = t
+		}
+	}
+	if err := seriesIter.Err(); err != nil {
+		return chunks.Meta{}, err
+	}
+
+	return chunks.Meta{
+		MinTime: mint,
+		MaxTime: maxt,
+		Chunk:   chk,
+	}, nil
+}
+
+//func (it *verticalMergeChunkIterator) Seek(t int64) bool {
+//	if it.initialized && it.curMeta.MaxTime >= t {
+//		return true
+//	}
+//
+//	it.aok, it.bok = it.a.Seek(t), it.b.Seek(t)
+//	it.initialized = true
+//	return it.Next()
+//}
+
+func (it *verticalMergeChunkIterator) At() chunks.Meta {
+	return it.curMeta
+}
+
+func (it *verticalMergeChunkIterator) Err() error {
+	if it.err != nil {
+		return it.err
+	}
 	if it.a.Err() != nil {
 		return it.a.Err()
 	}
@@ -1142,31 +1067,45 @@ func (it *chunkSeriesIterator) resetCurIterator() {
 	it.cur = it.bufDelIter
 }
 
-func (it *chunkSeriesIterator) Seek(t int64) (ok bool) {
-	if t > it.maxt {
+func (it *chunkSeriesIterator) Seek(t int64) bool {
+	if it.Err() != nil || it.i > len(it.chunks)-1 {
 		return false
 	}
 
-	// Seek to the first valid value after t.
+	if t > it.maxt {
+		// Exhaust iterator.
+		it.i = len(it.chunks)
+		return false
+	}
+
 	if t < it.mint {
 		t = it.mint
 	}
 
+	currI := it.i
 	for ; it.chunks[it.i].MaxTime < t; it.i++ {
 		if it.i == len(it.chunks)-1 {
+			// Exhaust iterator.
+			it.i = len(it.chunks)
 			return false
 		}
 	}
 
-	it.resetCurIterator()
-
-	for it.cur.Next() {
-		t0, _ := it.cur.At()
-		if t0 >= t {
-			return true
-		}
+	// Don't reset the iterator unless we've moved on to a different chunk.
+	if currI != it.i {
+		it.resetCurIterator()
 	}
-	return false
+
+	tc, _ := it.cur.At()
+	for t > tc {
+		if !it.cur.Next() {
+			// Exhaust iterator.
+			it.i = len(it.chunks)
+			return false
+		}
+		tc, _ = it.cur.At()
+	}
+	return true
 }
 
 func (it *chunkSeriesIterator) At() (t int64, v float64) {
@@ -1174,6 +1113,10 @@ func (it *chunkSeriesIterator) At() (t int64, v float64) {
 }
 
 func (it *chunkSeriesIterator) Next() bool {
+	if it.Err() != nil || it.i > len(it.chunks)-1 {
+		return false
+	}
+
 	if it.cur.Next() {
 		t, _ := it.cur.At()
 
@@ -1182,22 +1125,17 @@ func (it *chunkSeriesIterator) Next() bool {
 				return false
 			}
 			t, _ = it.At()
-
-			return t <= it.maxt
 		}
-		if t > it.maxt {
-			return false
-		}
-		return true
+		return t <= it.maxt
 	}
 	if err := it.cur.Err(); err != nil {
 		return false
 	}
-	if it.i == len(it.chunks)-1 {
+	it.i++
+	if it.i == len(it.chunks) {
 		return false
 	}
 
-	it.i++
 	it.resetCurIterator()
 
 	return it.Next()
@@ -1217,6 +1155,19 @@ type deletedIterator struct {
 
 func (it *deletedIterator) At() (int64, float64) {
 	return it.it.At()
+}
+
+func (it *deletedIterator) Seek(t int64) bool {
+	if atT, _ := it.At(); t >= atT {
+		return false
+	}
+
+	for it.Next() {
+		if atT, _ := it.At(); t >= atT {
+			return true
+		}
+	}
+	return false
 }
 
 func (it *deletedIterator) Next() bool {
@@ -1246,11 +1197,3 @@ Outer:
 func (it *deletedIterator) Err() error {
 	return it.it.Err()
 }
-
-type errSeriesSet struct {
-	err error
-}
-
-func (s errSeriesSet) Next() bool { return false }
-func (s errSeriesSet) At() Series { return nil }
-func (s errSeriesSet) Err() error { return s.err }
